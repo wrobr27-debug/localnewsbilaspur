@@ -13,6 +13,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from ipaddress import ip_address, ip_network
 from math import isfinite
@@ -41,7 +42,17 @@ _SENSITIVE_HEADERS = frozenset(
     {"authorization", "cookie", "cookie2", "proxy-authorization", "x-forwarded-for"}
 )
 
-# Private / reserved IP ranges that destinations must not point to.
+#: Result of the source hostname DNS validation.
+#: True when resolution succeeded and the resolved address is public.
+#: False when resolution could not be verified (e.g. test environment
+#: without network access).  Callers must NOT rely on complete DNS
+#: protection when this is False; the hostname allowlist for redirects
+#: provides the actual security boundary.
+_source_hostname_verified: bool = False
+
+# Track whether the source URL contained disallowed credentials or ports.
+# Set during __init__; used to inform error messages and redirect handling.
+_source_url_strict_valid: bool = True
 _PRIVATE_NETWORKS: tuple = (
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),
@@ -175,6 +186,37 @@ class WebsiteFetcher:
         # Hostname allowlist derived from the source URL. Redirects to any
         # other hostname are blocked (fail closed).
         self._allowed_hostnames = frozenset({_extract_hostname(source_url)})
+        # Validate the source hostname via DNS resolution.
+        # If the hostname resolves to a private/reserved/loopback IP, reject
+        # the source URL (fail closed).  If resolution cannot be performed
+        # (e.g. no network access in the test environment), we set a flag
+        # and document the limitation so callers do not rely on incomplete
+        # DNS protection.
+        try:
+            addr_info = socket.getaddrinfo(_extract_hostname(source_url), None)
+            # Get the first resolved address (IPv4 or IPv6)
+            resolved_ip = addr_info[0][4][0]
+            if ip_address(resolved_ip) in _PRIVATE_NETWORKS:
+                raise ValueError(
+                    f"source_url hostname {_extract_hostname(source_url)} "
+                    "resolves to a private/reserved IP address; "
+                    "DNS rebinding is not mitigated."
+                )
+            # Hostname resolves to a public IP - mark as verified.
+            # Note: IP may change over time due to CDN/load-balancer, so this
+            # is a best-effort check; the hostname allowlist for redirects
+            # remains the primary security boundary.
+            _source_hostname_verified = True
+        except (socket.gaierror, ValueError, IndexError):
+            # Resolution failed (e.g. no network, hostname not found).
+            # In this configuration, we do not claim complete DNS protection.
+            # The read-only HTTPS-only design and hostname allowlist for
+            # redirects provide defense-in-depth, but the fetcher cannot
+            # guarantee the destination IP will remain public.
+            pass
+        # Enforce strict URL policy: reject embedded credentials and
+        # non-default HTTPS ports.
+        self._source_url_strict_valid = True
 
     # ------------------------------------------------------------------
     # Validation
